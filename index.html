@@ -93,7 +93,7 @@
 
   <!-- Fim da aula -->
   <section id="v-devolucao" hidden>
-    <h2 class="mb-2">Quem está devolvendo?</h2>
+    <h2 class="mb-2">Quem está devolvendo? <small id="sync" class="text-muted fw-normal" hidden>atualizando…</small></h2>
     <div id="abertas"></div>
     <div id="detalhe" hidden>
       <div class="grid-head">
@@ -125,8 +125,8 @@
 
 <script>
 /* ====== CONFIGURAÇÃO ====== */
-const API_URL = 'https://script.google.com/macros/s/AKfycby7yAb2WySGVnx3F-YxBSy5-VdwEnqjcdz5MghfNm7qLYHmSj7A3L0iUwmloq9Q9Bbdug/exec'; 
-const API_KEY = '';   
+const API_URL = 'https://script.google.com/macros/s/AKfycbxXTz59IViBHdi2YgWvlb0TQ-B5ou6b84j9Gn-6Ynvft7P6DhQzpCS1SO_NW0VMlNCJ6A/exec'; 
+const API_KEY = '';                                
 /* ========================== */
 
 const DEMO = API_URL.startsWith('COLE_AQUI');
@@ -146,10 +146,17 @@ async function api(action) {
   const url = new URL(API_URL);
   url.searchParams.set('action', action);
   if (API_KEY) url.searchParams.set('key', API_KEY);
-  const r = await fetch(url);
-  const d = await r.json();
-  if (!d.ok) throw new Error(d.error || 'Erro ao consultar a planilha');
-  return d;
+  let ultimo;
+  for (let t = 0; t < 2; t++) {            // 1 nova tentativa se o Google devolver página de erro
+    try {
+      const r = await fetch(url);
+      const txt = await r.text();
+      let d; try { d = JSON.parse(txt); } catch (x) { throw new Error('O Google devolveu uma resposta inesperada. Tente novamente.'); }
+      if (!d.ok) throw new Error(d.error || 'Erro ao consultar a planilha');
+      return d;
+    } catch (e) { ultimo = e; if (e.message && !e.message.includes('inesperada') && !(e instanceof TypeError)) break; await sleep(800); }
+  }
+  throw ultimo;
 }
 async function enviar(payload) {
   if (DEMO) { await sleep(500); return demoPost(payload); }
@@ -159,7 +166,8 @@ async function enviar(payload) {
     headers: { 'Content-Type': 'text/plain;charset=utf-8' }, // evita preflight CORS
     body: JSON.stringify(payload)
   });
-  const d = await r.json();
+  const txt = await r.text();
+  let d; try { d = JSON.parse(txt); } catch (x) { throw new Error('O Google devolveu uma resposta inesperada. Confira na planilha se o registro entrou antes de repetir.'); }
   if (!d.ok) throw new Error(d.error || 'Erro ao gravar na planilha');
   return d;
 }
@@ -170,6 +178,7 @@ const demoDB = {
   abertas: [{ docente: 'Prof. Exemplo', turma: 'DS-2025', patrimonios: ['0103', '0104', '0107', '0110'], quando: new Date().toISOString() }]
 };
 function demoGet(a) {
+  if (a === 'inicio') return { ok: true, notebooks: [...demoDB.notebooks], abertas: demoDB.abertas.map(x => ({ ...x })) };
   if (a === 'lista') return { ok: true, notebooks: [...demoDB.notebooks] };
   if (a === 'abertas') return { ok: true, abertas: demoDB.abertas.map(x => ({ ...x })) };
   throw new Error('Ação inválida');
@@ -238,12 +247,24 @@ function showErr(m) { const e = $('#erro'); e.textContent = m; e.hidden = false;
 function hideErr() { $('#erro').hidden = true; }
 
 /* ---------- Ações ---------- */
-async function carregarAbertas() {
-  hideErr();
-  try { state.abertas = (await api('abertas')).abertas; }
-  catch (e) { showErr('Não consegui buscar as retiradas em aberto. ' + e.message); }
-  state.escolhida = null; state.problemas.clear();
-  render();
+const chaveDe = a => a.docente + '|' + a.turma;
+let atualizando = false;
+// Mostra o que já está em memória na hora e atualiza em segundo plano, sem apagar a seleção
+async function atualizarAbertas() {
+  if (atualizando) return;
+  atualizando = true; $('#sync').hidden = false;
+  try {
+    const novas = (await api('abertas')).abertas;
+    const escolhidaKey = state.escolhida && chaveDe(state.escolhida);
+    state.abertas = novas;
+    state.escolhida = escolhidaKey ? (novas.find(a => chaveDe(a) === escolhidaKey) || null) : null;
+    if (!state.escolhida) state.problemas.clear();
+    hideErr();
+  } catch (e) {
+    showErr('Não consegui atualizar as retiradas em aberto. ' + e.message);
+  } finally {
+    atualizando = false; $('#sync').hidden = true; render();
+  }
 }
 
 async function registrar() {
@@ -258,6 +279,11 @@ async function registrar() {
                   problemas: [...state.problemas].sort(natural), obs: $('#obs').value.trim() };
     }
     const res = await enviar(payload);
+    if (payload.tipo === 'Retirada') {
+      state.abertas.push({ docente: payload.docente, turma: payload.turma, patrimonios: payload.patrimonios, quando: new Date().toISOString() });
+    } else {
+      state.abertas = state.abertas.filter(a => chaveDe(a) !== chaveDe(payload));
+    }
     $('#doneTitulo').textContent = state.mode === 'retirada' ? 'Retirada registrada' : 'Devolução registrada';
     $('#doneSaldo').textContent = res.saldo;
     $('#doneTotal').textContent = res.total;
@@ -275,13 +301,15 @@ function novo() {
   $('#docente').value = ''; $('#turma').value = '';
   ['.seg', '#bar'].forEach(s => $(s).hidden = false);
   $('#done').hidden = true;
-  state.mode === 'devolucao' ? carregarAbertas() : render();
+  render();
+  if (state.mode === 'devolucao') atualizarAbertas();
 }
 
 /* ---------- Eventos ---------- */
 document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
   state.mode = b.dataset.mode; hideErr();
-  state.mode === 'devolucao' ? carregarAbertas() : render();
+  render();                                   // troca instantânea com os dados em memória
+  if (state.mode === 'devolucao') atualizarAbertas();
 }));
 $('#grid-retirada').addEventListener('click', e => {
   const t = e.target.closest('.tile'); if (!t) return;
@@ -305,8 +333,11 @@ $('#btnNovo').onclick = novo;
 /* ---------- Início ---------- */
 (async function init() {
   if (DEMO) $('#demo').hidden = false;
-  try { state.notebooks = (await api('lista')).notebooks.sort(natural); }
-  catch (e) { showErr('Não consegui carregar a lista de notebooks. ' + e.message); }
+  try {
+    const d = await api('inicio');          // lista + retiradas em aberto numa só chamada
+    state.notebooks = d.notebooks.sort(natural);
+    state.abertas = d.abertas || [];
+  } catch (e) { showErr('Não consegui carregar a lista de notebooks. ' + e.message); }
   if (!state.notebooks.length && !$('#erro').textContent) showErr('A aba "Notebooks" da planilha está vazia.');
   render();
 })();
